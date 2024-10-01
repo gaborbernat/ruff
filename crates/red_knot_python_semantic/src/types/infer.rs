@@ -50,8 +50,8 @@ use crate::stdlib::builtins_module_scope;
 use crate::types::diagnostic::{TypeCheckDiagnostic, TypeCheckDiagnostics};
 use crate::types::{
     bindings_ty, builtins_symbol_ty, declarations_ty, global_symbol_ty, symbol_ty,
-    typing_extensions_symbol_ty, BytesLiteralType, ClassType, FunctionType, StringLiteralType,
-    Truthiness, TupleType, Type, TypeArrayDisplay, UnionType,
+    typing_extensions_symbol_ty, BytesLiteralType, CallOutcome, ClassType, FunctionType,
+    StringLiteralType, Truthiness, TupleType, Type, TypeArrayDisplay, UnionType,
 };
 use crate::Db;
 
@@ -1306,6 +1306,39 @@ impl<'db> TypeInferenceBuilder<'db> {
             format_args!(
                 "Index {index} is out of bounds for string '{}' with length {length}.",
                 string_ty.display(self.db)
+            ),
+        );
+    }
+
+    /// Emit a diagnostic declaring that a type does not support subscripting.
+    pub(super) fn non_subscriptable_diagnostic(
+        &mut self,
+        node: AnyNodeRef,
+        non_subscriptable_ty: Type<'db>,
+    ) {
+        self.add_diagnostic(
+            node,
+            "non-subscriptable",
+            format_args!(
+                "`__getitem__` is not defined on type '{}', so subscription is not supported.",
+                non_subscriptable_ty.display(self.db)
+            ),
+        );
+    }
+
+    /// Emit a diagnostic declaring that a dunder method is not callable.
+    pub(super) fn dunder_not_callable_diagnostic(
+        &mut self,
+        node: AnyNodeRef,
+        not_callable_ty: Type<'db>,
+        dunder: &str,
+    ) {
+        self.add_diagnostic(
+            node,
+            "not-callable",
+            format_args!(
+                "Dunder method `{dunder}` is not callable on type '{}'.",
+                not_callable_ty.display(self.db)
             ),
         );
     }
@@ -2576,7 +2609,53 @@ impl<'db> TypeInferenceBuilder<'db> {
                         Type::Unknown
                     })
             }
-            _ => Type::Todo,
+            (value_ty, slice_ty) => {
+                // Resolve the value to its class.
+                let value_meta_ty = value_ty.to_meta_type(self.db);
+
+                // If the class defines `__getitem__`, return its return type.
+                //
+                // See: https://docs.python.org/3/reference/datamodel.html#class-getitem-versus-getitem
+                let dunder_getitem_method = value_meta_ty.member(self.db, "__getitem__");
+                if !dunder_getitem_method.is_unbound() {
+                    // TODO validate that the `__getitem__` argument adheres to the signature
+                    let CallOutcome::Callable { return_ty } =
+                        dunder_getitem_method.call(self.db, &[slice_ty])
+                    else {
+                        self.dunder_not_callable_diagnostic(
+                            (&**value).into(),
+                            value_ty,
+                            "__getitem__",
+                        );
+                        return Type::Unknown;
+                    };
+                    return return_ty;
+                }
+
+                // Otherwise, if the value is itself a class and defines `__class_getitem__`,
+                // return its return type.
+                if matches!(value_ty, Type::Class(_)) {
+                    let dunder_class_getitem_method = value_ty.member(self.db, "__class_getitem__");
+                    if !dunder_class_getitem_method.is_unbound() {
+                        // TODO validate that the `__class_getitem__` argument adheres to the signature
+                        let CallOutcome::Callable { return_ty } =
+                            dunder_class_getitem_method.call(self.db, &[slice_ty])
+                        else {
+                            self.dunder_not_callable_diagnostic(
+                                (&**value).into(),
+                                value_ty,
+                                "__class_getitem__",
+                            );
+                            return Type::Unknown;
+                        };
+                        return return_ty;
+                    }
+                }
+
+                // Otherwise, raise an exception.
+                self.non_subscriptable_diagnostic((&**value).into(), value_ty);
+                Type::Unknown
+            }
         }
     }
 
@@ -6707,6 +6786,65 @@ mod tests {
                 "Index -8 is out of bounds for string 'Literal[\"abcde\"]' with length 5.",
             ],
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn subscript_str() -> anyhow::Result<()> {
+        let mut db = setup_db();
+
+        db.write_dedented(
+            "/src/a.py",
+            "
+                def add(x: int, y: int) -> int:
+                    return x + y
+
+                a = 'abcde'[add(0, 1)]
+            ",
+        )?;
+
+        assert_public_ty(&db, "/src/a.py", "a", "str");
+
+        Ok(())
+    }
+
+    #[test]
+    fn subscript_getitem() -> anyhow::Result<()> {
+        let mut db = setup_db();
+
+        db.write_dedented(
+            "/src/a.py",
+            "
+                class Identity:
+                    def __getitem__(self, index: int) -> int:
+                        return index
+
+                a = Identity()[0]
+            ",
+        )?;
+
+        assert_public_ty(&db, "/src/a.py", "a", "int");
+
+        Ok(())
+    }
+
+    #[test]
+    fn subscript_class_getitem() -> anyhow::Result<()> {
+        let mut db = setup_db();
+
+        db.write_dedented(
+            "/src/a.py",
+            "
+                class Identity:
+                    def __class_getitem__(cls, item: int) -> str:
+                        return item
+
+                a = Identity[0]
+            ",
+        )?;
+
+        assert_public_ty(&db, "/src/a.py", "a", "str");
 
         Ok(())
     }
