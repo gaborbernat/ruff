@@ -613,8 +613,16 @@ impl<'db> Type<'db> {
                 })
             }
 
-            // TODO: handle classes which implement the `__call__` protocol
-            Type::Instance(_instance_ty) => CallOutcome::callable(Type::Todo),
+            Type::Instance(_) => {
+                // Get the class of the instance
+                let meta_ty = self.to_meta_type(db);
+                let dunder_call_method = meta_ty.member(db, "__call__");
+                if dunder_call_method.is_unbound() {
+                    CallOutcome::not_callable(self)
+                } else {
+                    dunder_call_method.call(db, arg_types)
+                }
+            }
 
             // `Any` is callable, and its return type is also `Any`.
             Type::Any => CallOutcome::callable(Type::Any),
